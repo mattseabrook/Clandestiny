@@ -1,5 +1,6 @@
 #include "config.h"
 
+#include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <map>
@@ -152,6 +153,17 @@ std::string escapeJson(std::string text) {
     return out;
 }
 
+fs::path siblingDiscRoot(const fs::path &path, const char *discName) {
+    if (path.empty()) {
+        return {};
+    }
+    fs::path parent = path.parent_path();
+    if (parent.empty()) {
+        return {};
+    }
+    return parent / discName;
+}
+
 } // namespace
 
 fs::path configFilePath() {
@@ -172,12 +184,45 @@ AppConfig loadConfig() {
 
     JsonReader reader(text);
     const std::map<std::string, std::string> values = reader.readObject();
-    auto it = values.find("clandestiny_root");
-    if (it == values.end()) {
-        it = values.find("clandestinyDiscRoot");
+    auto disc1 = values.find("clandestiny_disc1_root");
+    if (disc1 == values.end()) {
+        disc1 = values.find("clandestinyDisc1Root");
     }
-    if (it != values.end()) {
-        config.clandDiscRoot = it->second;
+    if (disc1 != values.end()) {
+        config.clandDisc1Root = disc1->second;
+    }
+
+    auto disc2 = values.find("clandestiny_disc2_root");
+    if (disc2 == values.end()) {
+        disc2 = values.find("clandestinyDisc2Root");
+    }
+    if (disc2 != values.end()) {
+        config.clandDisc2Root = disc2->second;
+    }
+
+    auto legacy = values.find("clandestiny_root");
+    if (legacy == values.end()) {
+        legacy = values.find("clandestinyDiscRoot");
+    }
+    if (legacy != values.end() && config.clandDisc1Root.empty() && config.clandDisc2Root.empty()) {
+        const fs::path root = legacy->second;
+        std::string leaf = root.filename().string();
+        std::transform(leaf.begin(), leaf.end(), leaf.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+        if (leaf == "disc2") {
+            config.clandDisc2Root = root;
+            const fs::path disc1Path = siblingDiscRoot(root, "disc1");
+            if (fs::is_directory(disc1Path)) {
+                config.clandDisc1Root = disc1Path;
+            }
+        } else {
+            config.clandDisc1Root = root;
+            const fs::path disc2Path = siblingDiscRoot(root, "disc2");
+            if (fs::is_directory(disc2Path)) {
+                config.clandDisc2Root = disc2Path;
+            }
+        }
     }
     return config;
 }
@@ -188,6 +233,7 @@ void saveConfig(const AppConfig &config) {
         throw std::runtime_error("Could not write config.json");
     }
     file << "{\n";
-    file << "  \"clandestiny_root\": \"" << escapeJson(config.clandDiscRoot.string()) << "\"\n";
+    file << "  \"clandestiny_disc1_root\": \"" << escapeJson(config.clandDisc1Root.string()) << "\",\n";
+    file << "  \"clandestiny_disc2_root\": \"" << escapeJson(config.clandDisc2Root.string()) << "\"\n";
     file << "}\n";
 }

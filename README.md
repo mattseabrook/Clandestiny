@@ -153,16 +153,17 @@ The main window contains:
 - An `Encode MP4` button for ffmpeg-based lossless MP4 output.
 - A status bar for decode, playback, and encode state.
 
-The asset table defaults to sorting by `Size` in ascending order. Click any
+The asset table defaults to sorting by `Size` in descending order. Click any
 column header to sort by that column.
 
 ## Configuration
 
-The GUI stores the configured Clandestiny root in `config.json`:
+The GUI stores both configured Clandestiny disc roots in `config.json`:
 
 ```json
 {
-  "clandestiny_root": "E:\\oezman-11h\\Clandestiny\\disc2"
+  "clandestiny_disc1_root": "E:\\oezman-11h\\Clandestiny\\disc1",
+  "clandestiny_disc2_root": "E:\\oezman-11h\\Clandestiny\\disc2"
 }
 ```
 
@@ -172,10 +173,15 @@ You can change this through:
 Edit -> Preferences...
 ```
 
+Older configs using `clandestiny_root` are still accepted. If the legacy path
+points at `disc1` or `disc2`, the loader tries to infer the sibling disc folder
+beside it.
+
 If no config path is present, the GUI first tries:
 
 ```text
 ./Clandestiny/disc1
+./Clandestiny/disc2
 ```
 
 and then falls back to the current working directory.
@@ -782,7 +788,7 @@ The GUI uses a Win32 Common Controls ListView in report mode. Columns are:
 Default sort:
 
 ```text
-Size ascending
+Size descending
 ```
 
 Clicking any column header resorts the table. Clicking the same column again
@@ -796,9 +802,10 @@ decode the selected resource. Instead, it:
 1. Captures the selected `ResourceEntry`.
 2. Starts a worker thread.
 3. Reopens the catalog in that worker.
-4. Reads the selected GJD byte range.
-5. Decodes frames and audio in memory.
-6. Posts the completed `DecodedMovie` back to the UI thread.
+4. Tries the configured disc roots according to the resource disc bitmask.
+5. Reads the selected GJD byte range from the disc that actually has it.
+6. Decodes frames and audio in memory.
+7. Posts the completed `DecodedMovie` back to the UI thread.
 
 Each decode request has a serial number. If the user selects another asset
 before an earlier decode finishes, the stale result is ignored.
@@ -819,6 +826,10 @@ Win32 timer ticks for UI invalidation
 Audio is started at playback begin using the decoded in-memory WAV data. Video
 frames are selected from elapsed time instead of "sleep one frame, advance one
 frame", which keeps the preview tied to the same wall-clock timeline as audio.
+
+The preview window suppresses background erase and paints through a back buffer
+before blitting to the screen. This keeps GDI playback from flickering while
+avoiding a larger Direct3D dependency for the current Win32-only GUI.
 
 ## Rendering Modes
 
@@ -1007,6 +1018,20 @@ https://github.com/scummvm/scummvm/blob/master/engines/groovie/script.cpp
 
 ## 2026-05-22
 
+- Changed the asset table default sort from `Size` ascending to `Size`
+  descending.
+- Expanded GUI preferences and `config.json` handling to track Disc 1 and Disc
+  2 roots separately.
+- Added legacy `clandestiny_root` migration behavior that infers a sibling disc
+  folder when possible.
+- Made GUI resource loading try configured disc roots according to the resource
+  disc bitmask, so Disc 1-only and Disc 2-only assets can be selected from the
+  same catalog view.
+- Changed preview painting to suppress background erase and draw through a GDI
+  back buffer before blitting to the screen.
+- Added a small current-frame BGRA cache for preview painting.
+- Reduced playback label updates during playback to avoid extra UI repaint
+  churn.
 - Added native Windows `build.cmd` support for Visual Studio Developer
   PowerShell / Developer Command Prompt builds.
 - Added macOS `build.command` support for CLI-only builds.

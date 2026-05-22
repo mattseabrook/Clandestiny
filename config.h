@@ -3,7 +3,8 @@
 #include <filesystem>
 
 struct AppConfig {
-    std::filesystem::path clandDiscRoot;
+    std::filesystem::path clandDisc1Root;
+    std::filesystem::path clandDisc2Root;
 };
 
 std::filesystem::path configFilePath();

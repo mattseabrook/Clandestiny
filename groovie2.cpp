@@ -1937,9 +1937,10 @@ constexpr int kIdFitMode = 1003;
 constexpr int kIdEncodeMp4 = 1004;
 constexpr int kIdFrameLabel = 1005;
 constexpr int kIdStatus = 1006;
-constexpr int kIdPrefsEdit = 1101;
-constexpr int kIdPrefsSave = 1102;
-constexpr int kIdPrefsCancel = 1103;
+constexpr int kIdPrefsDisc1Edit = 1101;
+constexpr int kIdPrefsDisc2Edit = 1102;
+constexpr int kIdPrefsSave = 1103;
+constexpr int kIdPrefsCancel = 1104;
 constexpr int kIdLogEdit = 1201;
 constexpr int kIdLogCopy = 1202;
 constexpr int kIdLogClose = 1203;
@@ -1982,9 +1983,12 @@ struct GuiState {
     AppConfig config;
     std::unique_ptr<Catalog> catalog;
     std::vector<ResourceEntry> visualEntries;
+    std::vector<fs::path> catalogRoots;
     fs::path catalogRoot;
     std::shared_ptr<DecodedMovie> current;
     int currentFrame = 0;
+    int previewBgraFrame = -1;
+    std::vector<uint8_t> previewBgra;
     std::vector<uint8_t> playWav;
     bool fitToWindow = true;
     bool loading = false;
@@ -1992,9 +1996,10 @@ struct GuiState {
     bool playing = false;
     bool populatingList = false;
     uint64_t playbackStartTick = 0;
+    uint64_t lastPlaybackLabelTick = 0;
     uint32_t decodeSerial = 0;
     int sortColumn = 1;
-    bool sortAscending = true;
+    bool sortAscending = false;
     std::string ffmpegLog;
 };
 
@@ -2089,6 +2094,8 @@ void clearCurrentMovie(GuiState &state) {
     stopPlayback(state);
     state.current.reset();
     state.currentFrame = 0;
+    state.previewBgraFrame = -1;
+    state.previewBgra.clear();
     state.playWav.clear();
     updateFrameLabel(state);
     if (state.preview) {
@@ -2096,13 +2103,36 @@ void clearCurrentMovie(GuiState &state) {
     }
 }
 
-fs::path defaultCatalogRoot(const GuiState &state) {
-    if (!state.config.clandDiscRoot.empty()) {
-        return state.config.clandDiscRoot;
-    }
+std::vector<fs::path> defaultCatalogRoots(const GuiState &state) {
+    std::vector<fs::path> roots;
+    auto addRoot = [&](const fs::path &path) {
+        if (path.empty()) {
+            return;
+        }
+        for (const fs::path &existing : roots) {
+            if (existing == path) {
+                return;
+            }
+        }
+        roots.push_back(path);
+    };
+
+    addRoot(state.config.clandDisc1Root);
+    addRoot(state.config.clandDisc2Root);
+
     const fs::path cwd = fs::current_path();
-    const fs::path bundledCandidate = cwd / "Clandestiny" / "disc1";
-    return fs::is_directory(bundledCandidate) ? bundledCandidate : cwd;
+    const fs::path bundledDisc1 = cwd / "Clandestiny" / "disc1";
+    const fs::path bundledDisc2 = cwd / "Clandestiny" / "disc2";
+    if (fs::is_directory(bundledDisc1)) {
+        addRoot(bundledDisc1);
+    }
+    if (fs::is_directory(bundledDisc2)) {
+        addRoot(bundledDisc2);
+    }
+    if (roots.empty()) {
+        addRoot(cwd);
+    }
+    return roots;
 }
 
 std::string formatHex(uint32_t value) {
@@ -2196,6 +2226,51 @@ int selectedAssetIndex(const GuiState &state) {
     return ListView_GetNextItem(state.assetList, -1, LVNI_SELECTED);
 }
 
+bool readResourceFromRoots(const std::vector<fs::path> &roots, const ResourceEntry &entry, std::vector<uint8_t> &out,
+                           std::string &sourceRoot, std::string &error) {
+    std::vector<size_t> order;
+    auto addIndex = [&](size_t index) {
+        if (index >= roots.size()) {
+            return;
+        }
+        if (std::find(order.begin(), order.end(), index) == order.end()) {
+            order.push_back(index);
+        }
+    };
+
+    if ((entry.disks & 0x1u) != 0) {
+        addIndex(0);
+    }
+    if ((entry.disks & 0x2u) != 0) {
+        addIndex(1);
+    }
+    for (size_t i = 0; i < roots.size(); ++i) {
+        addIndex(i);
+    }
+
+    std::ostringstream failures;
+    for (size_t index : order) {
+        const fs::path &root = roots[index];
+        try {
+            Catalog catalog(makeDataSource(root));
+            catalog.load();
+            if (catalog.readResource(entry, out)) {
+                sourceRoot = root.string();
+                return true;
+            }
+            failures << root.string() << ": resource bytes not present; ";
+        } catch (const std::exception &e) {
+            failures << root.string() << ": " << e.what() << "; ";
+        }
+    }
+
+    error = failures.str();
+    if (error.empty()) {
+        error = "no Clandestiny disc roots are configured";
+    }
+    return false;
+}
+
 void layoutMainWindow(GuiState &state, int width, int height) {
     const int margin = 8;
     const int statusHeight = 24;
@@ -2227,9 +2302,16 @@ void layoutMainWindow(GuiState &state, int width, int height) {
 
 void paintPreview(HWND hwnd, GuiState &state) {
     PAINTSTRUCT ps{};
-    HDC dc = BeginPaint(hwnd, &ps);
+    HDC screenDc = BeginPaint(hwnd, &ps);
     RECT rc{};
     GetClientRect(hwnd, &rc);
+    const int clientW = std::max(1, static_cast<int>(rc.right - rc.left));
+    const int clientH = std::max(1, static_cast<int>(rc.bottom - rc.top));
+
+    HDC dc = CreateCompatibleDC(screenDc);
+    HBITMAP backBuffer = CreateCompatibleBitmap(screenDc, clientW, clientH);
+    HGDIOBJ oldBitmap = SelectObject(dc, backBuffer);
+
     HBRUSH brush = CreateSolidBrush(RGB(32, 32, 32));
     FillRect(dc, &rc, brush);
     DeleteObject(brush);
@@ -2240,23 +2322,28 @@ void paintPreview(HWND hwnd, GuiState &state) {
         RECT textRc = rc;
         DrawTextA(dc, "Select a ROQ/RNR resource from the list", -1, &textRc,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        BitBlt(screenDc, 0, 0, clientW, clientH, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, oldBitmap);
+        DeleteObject(backBuffer);
+        DeleteDC(dc);
         EndPaint(hwnd, &ps);
         return;
     }
 
     const DecodedMovie &movie = *state.current;
     const std::vector<Pixel> &frame = movie.frames[static_cast<size_t>(state.currentFrame)];
-    std::vector<uint8_t> bgra;
-    bgra.reserve(frame.size() * 4);
-    for (const Pixel &p : frame) {
-        bgra.push_back(p.b);
-        bgra.push_back(p.g);
-        bgra.push_back(p.r);
-        bgra.push_back(p.a);
+    if (state.previewBgraFrame != state.currentFrame || state.previewBgra.size() != frame.size() * 4) {
+        state.previewBgra.clear();
+        state.previewBgra.reserve(frame.size() * 4);
+        for (const Pixel &p : frame) {
+            state.previewBgra.push_back(p.b);
+            state.previewBgra.push_back(p.g);
+            state.previewBgra.push_back(p.r);
+            state.previewBgra.push_back(p.a);
+        }
+        state.previewBgraFrame = state.currentFrame;
     }
 
-    const int clientW = rc.right - rc.left;
-    const int clientH = rc.bottom - rc.top;
     double scale = 1.0;
     if (state.fitToWindow) {
         const double sx = static_cast<double>(clientW) / std::max(1, movie.width);
@@ -2275,13 +2362,20 @@ void paintPreview(HWND hwnd, GuiState &state) {
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
     bmi.bmiHeader.biCompression = BI_RGB;
-    StretchDIBits(dc, x, y, drawW, drawH, 0, 0, movie.width, movie.height, bgra.data(), &bmi,
+    SetStretchBltMode(dc, COLORONCOLOR);
+    StretchDIBits(dc, x, y, drawW, drawH, 0, 0, movie.width, movie.height, state.previewBgra.data(), &bmi,
                   DIB_RGB_COLORS, SRCCOPY);
+    BitBlt(screenDc, 0, 0, clientW, clientH, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldBitmap);
+    DeleteObject(backBuffer);
+    DeleteDC(dc);
     EndPaint(hwnd, &ps);
 }
 
 LRESULT CALLBACK PreviewProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
     case WM_PAINT:
         if (gGui) {
             paintPreview(hwnd, *gGui);
@@ -2302,26 +2396,45 @@ void loadCatalogForGui(GuiState &state) {
     state.visualEntries.clear();
     state.catalog.reset();
 
-    fs::path root = defaultCatalogRoot(state);
+    std::vector<fs::path> roots = defaultCatalogRoots(state);
+    fs::path root;
     try {
-        auto catalog = std::make_unique<Catalog>(makeDataSource(root));
-        catalog->load();
+        std::unique_ptr<Catalog> catalog;
+        std::string loadErrors;
+        for (const fs::path &candidate : roots) {
+            try {
+                auto candidateCatalog = std::make_unique<Catalog>(makeDataSource(candidate));
+                candidateCatalog->load();
+                catalog = std::move(candidateCatalog);
+                root = candidate;
+                break;
+            } catch (const std::exception &e) {
+                loadErrors += candidate.string() + ": " + e.what() + "; ";
+            }
+        }
+        if (!catalog) {
+            throw std::runtime_error(loadErrors.empty() ? "no Clandestiny disc roots are configured" : loadErrors);
+        }
         for (const ResourceEntry &entry : catalog->entries()) {
             if (!isVisualResourceName(entry.name)) {
                 continue;
             }
             state.visualEntries.push_back(entry);
         }
+        state.catalogRoots = roots;
         state.catalogRoot = root;
         sortVisualEntries(state);
         populateAssetList(state);
         state.catalog = std::move(catalog);
         std::ostringstream ss;
         ss << state.visualEntries.size() << " visual resources loaded from " << root.string();
+        if (roots.size() > 1) {
+            ss << " with " << roots.size() << " configured disc roots";
+        }
         setStatus(state, ss.str());
     } catch (const std::exception &e) {
         std::ostringstream ss;
-        ss << "Could not load catalog from " << root.string() << ": " << e.what()
+        ss << "Could not load catalog: " << e.what()
            << "  |  Edit > Preferences writes " << configFilePath().string();
         setStatus(state, ss.str());
     }
@@ -2336,7 +2449,7 @@ void loadSelectedMovie(GuiState &state) {
         return;
     }
     const ResourceEntry entry = state.visualEntries[static_cast<size_t>(sel)];
-    const fs::path root = state.catalogRoot;
+    const std::vector<fs::path> roots = state.catalogRoots.empty() ? defaultCatalogRoots(state) : state.catalogRoots;
     const uint32_t serial = ++state.decodeSerial;
     state.loading = true;
     clearCurrentMovie(state);
@@ -2345,16 +2458,16 @@ void loadSelectedMovie(GuiState &state) {
     setStatus(state, "Decoding " + entry.name + " in the background...");
 
     HWND hwnd = state.hwnd;
-    std::thread([hwnd, root, entry, serial]() {
+    std::thread([hwnd, roots, entry, serial]() {
         auto *result = new MovieLoadResult;
         result->serial = serial;
         result->entryName = entry.name;
         try {
-            Catalog catalog(makeDataSource(root));
-            catalog.load();
             std::vector<uint8_t> data;
-            if (!catalog.readResource(entry, data)) {
-                throw std::runtime_error("resource is not present in the configured data path");
+            std::string sourceRoot;
+            std::string readError;
+            if (!readResourceFromRoots(roots, entry, data, sourceRoot, readError)) {
+                throw std::runtime_error("resource is not present in configured disc roots: " + readError);
             }
             DecodeOptions options;
             options.writeFiles = false;
@@ -2371,6 +2484,7 @@ void loadSelectedMovie(GuiState &state) {
             if (result->movie->audioChunks > 0) {
                 ss << ", " << result->movie->audioChunks << " audio chunks";
             }
+            ss << " from " << sourceRoot;
             result->message = ss.str();
         } catch (const std::exception &e) {
             result->message = e.what();
@@ -2399,7 +2513,11 @@ void tickPlayback(GuiState &state) {
     const int nextFrame = static_cast<int>(targetFrame);
     if (nextFrame != state.currentFrame) {
         state.currentFrame = nextFrame;
-        updateFrameLabel(state);
+        const uint64_t now = GetTickCount64();
+        if (now - state.lastPlaybackLabelTick >= 250) {
+            state.lastPlaybackLabelTick = now;
+            updateFrameLabel(state);
+        }
         InvalidateRect(state.preview, nullptr, FALSE);
     }
 }
@@ -2415,6 +2533,7 @@ void togglePlayback(GuiState &state) {
     state.currentFrame = 0;
     state.playing = true;
     state.playbackStartTick = GetTickCount64();
+    state.lastPlaybackLabelTick = 0;
     if (!state.current->pcm.empty()) {
         state.playWav = makeWavPCM16Stereo(state.current->pcm);
         PlaySoundA(reinterpret_cast<LPCSTR>(state.playWav.data()), nullptr, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
@@ -2611,28 +2730,37 @@ LRESULT CALLBACK PrefsProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam
         state = reinterpret_cast<GuiState *>(create->lpCreateParams);
         SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
         state->preferences = hwnd;
-        CreateWindowExA(0, "STATIC", "Clandestiny disc/root folder:", WS_CHILD | WS_VISIBLE, 12, 14, 220, 22, hwnd,
+        CreateWindowExA(0, "STATIC", "Clandestiny Disc 1 root:", WS_CHILD | WS_VISIBLE, 12, 14, 220, 22, hwnd,
                         nullptr, state->instance, nullptr);
-        HWND edit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", state->config.clandDiscRoot.string().c_str(),
-                                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 12, 40, 670, 24, hwnd,
-                                    reinterpret_cast<HMENU>(kIdPrefsEdit), state->instance, nullptr);
-        HWND save = CreateWindowExA(0, "BUTTON", "Save", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 506, 78, 82,
+        HWND disc1 = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", state->config.clandDisc1Root.string().c_str(),
+                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 12, 38, 670, 24, hwnd,
+                                     reinterpret_cast<HMENU>(kIdPrefsDisc1Edit), state->instance, nullptr);
+        CreateWindowExA(0, "STATIC", "Clandestiny Disc 2 root:", WS_CHILD | WS_VISIBLE, 12, 72, 220, 22, hwnd,
+                        nullptr, state->instance, nullptr);
+        HWND disc2 = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", state->config.clandDisc2Root.string().c_str(),
+                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 12, 96, 670, 24, hwnd,
+                                     reinterpret_cast<HMENU>(kIdPrefsDisc2Edit), state->instance, nullptr);
+        HWND save = CreateWindowExA(0, "BUTTON", "Save", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON, 506, 132, 82,
                                     28, hwnd, reinterpret_cast<HMENU>(kIdPrefsSave), state->instance, nullptr);
-        HWND cancel = CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 600, 78, 82, 28, hwnd,
+        HWND cancel = CreateWindowExA(0, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE, 600, 132, 82, 28, hwnd,
                                       reinterpret_cast<HMENU>(kIdPrefsCancel), state->instance, nullptr);
-        setControlFont(GetDlgItem(hwnd, kIdPrefsEdit), state->font);
+        setControlFont(disc1, state->font);
+        setControlFont(disc2, state->font);
         setControlFont(save, state->font);
         setControlFont(cancel, state->font);
-        SetFocus(edit);
+        SetFocus(disc1);
         return 0;
     }
     case WM_COMMAND:
         switch (LOWORD(wParam)) {
         case kIdPrefsSave: {
-            char buffer[4096]{};
-            GetWindowTextA(GetDlgItem(hwnd, kIdPrefsEdit), buffer, static_cast<int>(sizeof(buffer)));
+            char disc1[4096]{};
+            char disc2[4096]{};
+            GetWindowTextA(GetDlgItem(hwnd, kIdPrefsDisc1Edit), disc1, static_cast<int>(sizeof(disc1)));
+            GetWindowTextA(GetDlgItem(hwnd, kIdPrefsDisc2Edit), disc2, static_cast<int>(sizeof(disc2)));
             try {
-                state->config.clandDiscRoot = buffer;
+                state->config.clandDisc1Root = disc1;
+                state->config.clandDisc2Root = disc2;
                 saveConfig(state->config);
                 DestroyWindow(hwnd);
                 loadCatalogForGui(*state);
@@ -2668,7 +2796,7 @@ void showPreferences(GuiState &state) {
         return;
     }
     HWND hwnd = CreateWindowExA(WS_EX_DLGMODALFRAME, "GrooviePrefsWindow", "Preferences",
-                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 720, 150,
+                                WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 720, 205,
                                 state.hwnd, nullptr, state.instance, &state);
     ShowWindow(hwnd, SW_SHOW);
 }
@@ -2796,11 +2924,15 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
         if (result->ok) {
             state->current = result->movie;
             state->currentFrame = 0;
+            state->previewBgraFrame = -1;
+            state->previewBgra.clear();
             state->playWav.clear();
             setStatus(*state, result->message);
         } else {
             state->current.reset();
             state->currentFrame = 0;
+            state->previewBgraFrame = -1;
+            state->previewBgra.clear();
             setStatus(*state, result->entryName + ": " + result->message);
             MessageBoxA(state->hwnd, result->message.c_str(), result->entryName.c_str(), MB_ICONERROR | MB_OK);
         }
